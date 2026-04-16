@@ -1,0 +1,48 @@
+name: Sync output folder to Overleaf repo
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Output/**"
+  workflow_dispatch:
+
+jobs:
+  sync-output:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code repo
+        uses: actions/checkout@v4
+        with:
+          path: code-repo
+
+      - name: Checkout Overleaf-linked repo
+        uses: actions/checkout@v4
+        with:
+          repository: PeOll/TMS088---Project-Report
+          token: ${{ secrets.OVERLEAF_REPO_TOKEN }}
+          path: overleaf-repo
+          ref: main
+
+      - name: Copy output folder into Overleaf repo
+        run: |
+          mkdir -p overleaf-repo/output
+          rsync -av --delete code-repo/Output/ overleaf-repo/output/
+
+      - name: Commit and push changes
+        working-directory: overleaf-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add output
+
+          if git diff --cached --quiet; then
+            echo "No output changes to sync"
+            exit 0
+          fi
+
+          git commit -m "Sync output from code repo"
+          git push origin main
