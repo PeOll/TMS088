@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tsa.stattools import pacf
 
 
 def _default_data_dir() -> Path:
@@ -162,6 +163,14 @@ class PriceAnalysis:
             acf_values.append(numerator / denominator)
 
         return np.array(acf_values)
+
+    def sample_pacf(self, series: pd.Series, max_lag: int = 30, method: str = "ywm") -> np.ndarray:
+        clean = series.dropna()
+
+        if len(clean) <= max_lag:
+            raise ValueError("Series is too short for the requested number of lags.")
+
+        return pacf(clean.to_numpy(), nlags=max_lag, method=method)
 
     def _acf_summary(self, data: pd.DataFrame, max_lag: int = 30) -> pd.DataFrame:
         summary = []
