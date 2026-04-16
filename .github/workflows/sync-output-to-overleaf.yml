@@ -28,8 +28,8 @@ jobs:
 
       - name: Copy output folder into Overleaf repo
         run: |
-          mkdir -p overleaf-repo/output
-          rsync -av --delete code-repo/Output/ overleaf-repo/output/
+          mkdir -p overleaf-repo/Figures/resources
+          rsync -av --delete code-repo/Output/ overleaf-repo/Figures/resources/
 
       - name: Commit and push changes
         working-directory: overleaf-repo
@@ -37,7 +37,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add output
+          git add Figures/resources
 
           if git diff --cached --quiet; then
             echo "No output changes to sync"
