@@ -1,5 +1,6 @@
 # TMS088
 Course Project in Financial Time Series Spring 2026
+[Project Report in Overleaf](https://www.overleaf.com/3716575738zyrvtvnbwcns#c841af)
 
 ## Repository Structure
 

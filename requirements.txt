@@ -5,3 +5,5 @@ pathlib
 ipynb
 seaborn
 scipy
+statsmodels
+arch
