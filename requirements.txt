@@ -3,7 +3,10 @@ numpy
 matplotlib
 pathlib
 ipynb
+ipython
 seaborn
 scipy
 statsmodels
 arch
+scikit-learn
+jinja2
