@@ -14,6 +14,7 @@ os.environ.setdefault("LOKY_MAX_CPU_COUNT", "4")
 
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.diagnostic import acorr_ljungbox
@@ -792,6 +793,980 @@ def rolling_pairwise_correlations(
     rolling.attrs["window"] = window
     rolling.attrs["min_periods"] = min_periods
     return rolling
+
+
+VOLATILITY_REGIME_ORDER = ("low", "medium", "high")
+
+
+def _regime_spans(regime_series: pd.Series) -> list[dict[str, object]]:
+    """Contiguous non-missing regime spans by integer position."""
+    spans: list[dict[str, object]] = []
+    current_label = None
+    start_pos = None
+    end_pos = None
+    length = 0
+    block_id = 0
+
+    def close_span() -> None:
+        if current_label is None:
+            return
+        spans.append(
+            {
+                "label": current_label,
+                "start_pos": start_pos,
+                "end_pos": end_pos,
+                "length": length,
+                "block_id": block_id,
+            }
+        )
+
+    for position, label in enumerate(regime_series.to_numpy(dtype=object)):
+        if pd.isna(label):
+            close_span()
+            current_label = None
+            start_pos = None
+            end_pos = None
+            length = 0
+            block_id += 1
+            continue
+
+        if current_label is None or label != current_label:
+            close_span()
+            current_label = label
+            start_pos = position
+            length = 1
+        else:
+            length += 1
+
+        end_pos = position
+
+    close_span()
+    return spans
+
+
+def enforce_minimum_regime_spell_length(
+    regime_series: pd.Series,
+    min_spell_length: int,
+    values: pd.Series | None = None,
+    centers: dict[str, float] | None = None,
+) -> tuple[pd.Series, int]:
+    """Merge short regime spells into neighboring states.
+
+    Short spells are treated as boundary noise rather than independent regimes.
+    They are merged into the adjacent spell with the same label when possible,
+    otherwise into the longer neighboring spell. If both neighbors have the same
+    length, the neighbor whose fitted center is closer to the short spell's
+    median value is used.
+    """
+    if min_spell_length <= 1:
+        return regime_series.copy(), 0
+
+    smoothed = regime_series.copy()
+    n_merged = 0
+    max_iterations = max(1, len(smoothed))
+
+    for _ in range(max_iterations):
+        spans = _regime_spans(smoothed)
+        short_candidates = [
+            (span_index, span)
+            for span_index, span in enumerate(spans)
+            if span["length"] < min_spell_length
+        ]
+
+        if not short_candidates:
+            break
+
+        merge_plan = None
+        for span_index, span in sorted(short_candidates, key=lambda item: item[1]["length"]):
+            neighbors = []
+            if span_index > 0 and spans[span_index - 1]["block_id"] == span["block_id"]:
+                neighbors.append(spans[span_index - 1])
+            if span_index + 1 < len(spans) and spans[span_index + 1]["block_id"] == span["block_id"]:
+                neighbors.append(spans[span_index + 1])
+
+            if not neighbors:
+                continue
+
+            if len(neighbors) == 2 and neighbors[0]["label"] == neighbors[1]["label"]:
+                target_label = neighbors[0]["label"]
+            else:
+                longest_length = max(neighbor["length"] for neighbor in neighbors)
+                longest_neighbors = [neighbor for neighbor in neighbors if neighbor["length"] == longest_length]
+
+                if len(longest_neighbors) == 1 or values is None or centers is None:
+                    target_label = longest_neighbors[0]["label"]
+                else:
+                    spell_values = values.iloc[int(span["start_pos"]) : int(span["end_pos"]) + 1].dropna()
+                    if spell_values.empty:
+                        target_label = longest_neighbors[0]["label"]
+                    else:
+                        spell_center = spell_values.median()
+
+                        def center_distance(neighbor: dict[str, object]) -> float:
+                            center = centers.get(str(neighbor["label"]), np.nan)
+                            if pd.isna(center):
+                                return np.inf
+                            return abs(spell_center - center)
+
+                        target_label = min(longest_neighbors, key=center_distance)["label"]
+
+            if target_label != span["label"]:
+                merge_plan = (span, target_label)
+                break
+
+        if merge_plan is None:
+            break
+
+        span, target_label = merge_plan
+        smoothed.iloc[int(span["start_pos"]) : int(span["end_pos"]) + 1] = target_label
+        n_merged += 1
+
+    return smoothed, n_merged
+
+
+def rolling_realized_volatility(
+    returns: pd.DataFrame,
+    window: int = 63,
+    min_periods: int | None = None,
+    annualization: int | None = None,
+) -> pd.DataFrame:
+    """Rolling standard deviation of log-returns, with gaps left unclassified."""
+    if min_periods is None:
+        min_periods = int(0.8 * window)
+
+    volatility = returns.rolling(window=window, min_periods=min_periods).std()
+    volatility = volatility.where(returns.notna())
+
+    if annualization is not None:
+        volatility = volatility * np.sqrt(annualization)
+
+    volatility.attrs["window"] = window
+    volatility.attrs["min_periods"] = min_periods
+    volatility.attrs["annualization"] = annualization
+    return volatility
+
+
+def classify_volatility_regimes(
+    returns: pd.DataFrame,
+    window: int = 63,
+    min_periods: int | None = None,
+    lower_quantile: float = 1 / 3,
+    upper_quantile: float = 2 / 3,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+    method: str = "gmm",
+    max_regimes: int = 3,
+    min_regime_share: float = 0.03,
+    min_spell_length: int = 1,
+    random_state: int = 42,
+) -> dict[str, pd.DataFrame]:
+    """Classify each asset's rolling volatility into relative volatility regimes.
+
+    The default method fits Gaussian mixtures to log rolling volatility and
+    selects the number of states by BIC, up to ``max_regimes``. The older
+    quantile method is still available with ``method="quantile"``.
+
+    Labels describe an asset's volatility relative to its own history, not its
+    absolute scale relative to the other assets.
+    """
+    if not 0 < lower_quantile < upper_quantile < 1:
+        raise ValueError("Expected 0 < lower_quantile < upper_quantile < 1.")
+    if len(labels) != 3:
+        raise ValueError("Expected exactly three regime labels.")
+    if method not in {"gmm", "quantile"}:
+        raise ValueError("method must be either 'gmm' or 'quantile'.")
+    if not 1 <= max_regimes <= len(labels):
+        raise ValueError("max_regimes must be between 1 and the number of labels.")
+
+    rolling_volatility = rolling_realized_volatility(
+        returns,
+        window=window,
+        min_periods=min_periods,
+    )
+    regimes = pd.DataFrame(index=rolling_volatility.index, columns=rolling_volatility.columns, dtype="object")
+    thresholds = []
+
+    for column in rolling_volatility.columns:
+        values = rolling_volatility[column].dropna()
+        if values.empty:
+            thresholds.append(
+                {
+                    "series": column,
+                    "low_medium_threshold": np.nan,
+                    "medium_high_threshold": np.nan,
+                    "low_center": np.nan,
+                    "medium_center": np.nan,
+                    "high_center": np.nan,
+                    "n_regimes": 0,
+                    "n_fitted_regimes": 0,
+                    "regime_method": method,
+                    "min_spell_length": min_spell_length,
+                    "n_short_spells_merged": 0,
+                    "n_classified_windows": 0,
+                }
+            )
+            continue
+
+        if method == "quantile":
+            low_threshold = values.quantile(lower_quantile)
+            high_threshold = values.quantile(upper_quantile)
+            observed = rolling_volatility[column].notna()
+
+            regimes.loc[observed & (rolling_volatility[column] <= low_threshold), column] = labels[0]
+            regimes.loc[
+                observed
+                & (rolling_volatility[column] > low_threshold)
+                & (rolling_volatility[column] <= high_threshold),
+                column,
+            ] = labels[1]
+            regimes.loc[observed & (rolling_volatility[column] > high_threshold), column] = labels[2]
+            centers = {
+                labels[0]: values[values <= low_threshold].median(),
+                labels[1]: values[(values > low_threshold) & (values <= high_threshold)].median(),
+                labels[2]: values[values > high_threshold].median(),
+            }
+            n_fitted_regimes = 3
+
+        else:
+            positive_values = values[values > 0]
+            if positive_values.empty:
+                regimes.loc[values.index, column] = labels[1]
+                low_threshold = np.nan
+                high_threshold = np.nan
+                centers = {labels[0]: np.nan, labels[1]: np.nan, labels[2]: np.nan}
+                n_fitted_regimes = 1
+            else:
+                volatility_floor = positive_values.min() * 0.5
+                log_values = np.log(values.clip(lower=volatility_floor).to_numpy()).reshape(-1, 1)
+                max_valid_regimes = min(max_regimes, len(np.unique(log_values)), len(log_values))
+
+                candidates = []
+                for n_components in range(1, max_valid_regimes + 1):
+                    model = GaussianMixture(
+                        n_components=n_components,
+                        covariance_type="full",
+                        n_init=10,
+                        random_state=random_state,
+                    ).fit(log_values)
+                    component = model.predict(log_values)
+                    component_shares = np.bincount(component, minlength=n_components) / len(component)
+                    candidates.append(
+                        {
+                            "model": model,
+                            "component": component,
+                            "bic": model.bic(log_values),
+                            "min_share": component_shares.min(),
+                        }
+                    )
+
+                valid_candidates = [
+                    candidate for candidate in candidates if candidate["min_share"] >= min_regime_share
+                ]
+                best = min(valid_candidates or candidates, key=lambda candidate: candidate["bic"])
+                model = best["model"]
+                component = best["component"]
+                ordered_components = np.argsort(model.means_.ravel())
+                n_fitted_regimes = len(ordered_components)
+
+                if n_fitted_regimes == 1:
+                    ordered_labels = [labels[1]]
+                elif n_fitted_regimes == 2:
+                    ordered_labels = [labels[0], labels[2]]
+                else:
+                    ordered_labels = list(labels)
+
+                component_to_label = {
+                    component_id: ordered_labels[rank]
+                    for rank, component_id in enumerate(ordered_components)
+                }
+                regimes.loc[values.index, column] = [component_to_label[component_id] for component_id in component]
+
+                center_by_label = {
+                    component_to_label[component_id]: np.exp(model.means_.ravel()[component_id])
+                    for component_id in ordered_components
+                }
+                centers = {label: center_by_label.get(label, np.nan) for label in labels}
+
+                ordered_log_centers = np.sort(model.means_.ravel())
+                if n_fitted_regimes == 1:
+                    low_threshold = np.nan
+                    high_threshold = np.nan
+                elif n_fitted_regimes == 2:
+                    low_threshold = np.exp(ordered_log_centers[:2].mean())
+                    high_threshold = np.nan
+                else:
+                    low_threshold = np.exp(ordered_log_centers[:2].mean())
+                    high_threshold = np.exp(ordered_log_centers[1:3].mean())
+
+        smoothed, n_short_spells_merged = enforce_minimum_regime_spell_length(
+            regimes[column],
+            min_spell_length=min_spell_length,
+            values=rolling_volatility[column],
+            centers=centers,
+        )
+        regimes[column] = smoothed
+        n_regimes = regimes[column].dropna().nunique()
+
+        thresholds.append(
+            {
+                "series": column,
+                "low_medium_threshold": low_threshold,
+                "medium_high_threshold": high_threshold,
+                "low_center": centers[labels[0]],
+                "medium_center": centers[labels[1]],
+                "high_center": centers[labels[2]],
+                "n_regimes": n_regimes,
+                "n_fitted_regimes": n_fitted_regimes,
+                "regime_method": method,
+                "min_spell_length": min_spell_length,
+                "n_short_spells_merged": n_short_spells_merged,
+                "n_classified_windows": int(values.notna().sum()),
+            }
+        )
+
+    thresholds_frame = pd.DataFrame(thresholds).set_index("series")
+    regimes.attrs["labels"] = labels
+    regimes.attrs["window"] = window
+    regimes.attrs["min_periods"] = rolling_volatility.attrs["min_periods"]
+
+    return {
+        "rolling_volatility": rolling_volatility,
+        "regimes": regimes,
+        "thresholds": thresholds_frame,
+    }
+
+
+def volatility_regime_spells(
+    regimes: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return contiguous same-regime episodes for each asset."""
+    rows = []
+
+    for column in regimes.columns:
+        current_regime = None
+        spell_start = None
+        spell_end = None
+        spell_length = 0
+
+        def close_spell() -> None:
+            if current_regime is None:
+                return
+            rows.append(
+                {
+                    "series": column,
+                    "regime": current_regime,
+                    "start": spell_start,
+                    "end": spell_end,
+                    "length": spell_length,
+                }
+            )
+
+        for day, regime in regimes[column].items():
+            if pd.isna(regime):
+                close_spell()
+                current_regime = None
+                spell_start = None
+                spell_end = None
+                spell_length = 0
+                continue
+
+            if regime != current_regime:
+                close_spell()
+                current_regime = regime
+                spell_start = day
+                spell_length = 1
+            else:
+                spell_length += 1
+
+            spell_end = day
+
+        close_spell()
+
+    if not rows:
+        return pd.DataFrame(columns=["series", "regime", "start", "end", "length"])
+
+    return pd.DataFrame(rows)
+
+
+def summarize_volatility_regimes(
+    regimes: pd.DataFrame,
+    rolling_volatility: pd.DataFrame,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+) -> pd.DataFrame:
+    """Summarize regime frequency, volatility level, and spell persistence."""
+    spells = volatility_regime_spells(regimes)
+    rows = []
+
+    for column in regimes.columns:
+        classified = regimes[column].notna()
+        n_classified = int(classified.sum())
+
+        for label in labels:
+            mask = regimes[column] == label
+            regime_spells = spells[(spells["series"] == column) & (spells["regime"] == label)]
+            rows.append(
+                {
+                    "series": column,
+                    "regime": label,
+                    "n_windows": int(mask.sum()),
+                    "share_windows": mask.sum() / n_classified if n_classified else np.nan,
+                    "mean_rolling_volatility": rolling_volatility.loc[mask, column].mean(),
+                    "median_rolling_volatility": rolling_volatility.loc[mask, column].median(),
+                    "n_spells": len(regime_spells),
+                    "avg_spell_length": regime_spells["length"].mean() if len(regime_spells) else np.nan,
+                    "max_spell_length": regime_spells["length"].max() if len(regime_spells) else np.nan,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def volatility_regime_transition_summary(
+    regimes: pd.DataFrame,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+) -> pd.DataFrame:
+    """Summarize how persistent each asset's volatility regimes are."""
+    rows = []
+
+    for column in regimes.columns:
+        current = regimes[column]
+        previous = current.shift(1)
+        comparable = current.notna() & previous.notna()
+        n_comparable = int(comparable.sum())
+
+        row: dict[str, object] = {
+            "series": column,
+            "n_comparable_steps": n_comparable,
+            "transition_rate": np.nan,
+            "same_regime_share": np.nan,
+        }
+
+        if n_comparable:
+            changed = current[comparable] != previous[comparable]
+            row["transition_rate"] = changed.mean()
+            row["same_regime_share"] = 1 - changed.mean()
+
+        for label in labels:
+            label_previous = comparable & (previous == label)
+            denominator = int(label_previous.sum())
+            row[f"{label}_persistence"] = (
+                ((current == label) & label_previous).sum() / denominator if denominator else np.nan
+            )
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def volatility_regime_shares(
+    regimes: pd.DataFrame,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+) -> pd.DataFrame:
+    """Share of currently classified assets in each volatility regime."""
+    valid_count = regimes.notna().sum(axis=1).replace(0, np.nan)
+    return pd.DataFrame({label: regimes.eq(label).sum(axis=1) / valid_count for label in labels})
+
+
+def _regime_numeric_frame(
+    regimes: pd.DataFrame,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+) -> pd.DataFrame:
+    mapping = {label: value for value, label in enumerate(labels)}
+    return regimes.apply(lambda column: column.map(mapping)).astype(float)
+
+
+def _set_sparse_time_ticks(ax, index: pd.Index, n_ticks: int = 8) -> None:
+    if len(index) == 0:
+        return
+
+    positions = np.linspace(0, len(index) - 1, min(n_ticks, len(index))).astype(int)
+    ax.set_xticks(positions + 0.5)
+    ax.set_xticklabels([str(index[position]) for position in positions], rotation=0)
+
+
+def plot_volatility_regime_heatmap(
+    regimes: pd.DataFrame,
+    output_path: Path,
+    title: str,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+) -> None:
+    """Plot low/medium/high volatility regimes through time for each asset."""
+    from matplotlib.colors import ListedColormap
+
+    numeric = _regime_numeric_frame(regimes, labels=labels)
+    cmap = ListedColormap(["#4C78A8", "#BAB0AC", "#E45756"])
+
+    fig, ax = plt.subplots(figsize=(14, 0.75 * len(regimes.columns) + 2))
+    heatmap = sns.heatmap(
+        numeric.T,
+        cmap=cmap,
+        vmin=-0.5,
+        vmax=len(labels) - 0.5,
+        cbar_kws={"ticks": range(len(labels)), "label": "volatility regime"},
+        ax=ax,
+    )
+    colorbar = heatmap.collections[0].colorbar
+    colorbar.set_ticklabels(labels)
+    _set_sparse_time_ticks(ax, regimes.index)
+    ax.set_title(title)
+    ax.set_xlabel("day")
+    ax.set_ylabel("series")
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.show()
+
+
+def plot_rolling_volatility_regimes(
+    rolling_volatility: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    output_path: Path,
+    title: str,
+) -> None:
+    """Plot rolling volatility with the low/medium/high threshold lines."""
+    fig, axes = plt.subplots(
+        len(rolling_volatility.columns),
+        1,
+        figsize=(14, 2.1 * len(rolling_volatility.columns)),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for row, column in enumerate(rolling_volatility.columns):
+        ax = axes[row, 0]
+        ax.plot(rolling_volatility.index, rolling_volatility[column], color="tab:red", linewidth=1)
+        if column in thresholds.index:
+            low_threshold = thresholds.loc[column, "low_medium_threshold"]
+            high_threshold = thresholds.loc[column, "medium_high_threshold"]
+            if pd.notna(low_threshold):
+                ax.axhline(
+                    low_threshold,
+                    color="tab:blue",
+                    linestyle="--",
+                    linewidth=1,
+                    alpha=0.8,
+                )
+            if pd.notna(high_threshold):
+                ax.axhline(
+                    high_threshold,
+                    color="tab:purple",
+                    linestyle="--",
+                    linewidth=1,
+                    alpha=0.8,
+                )
+        ax.set_ylabel(column)
+        ax.grid(True, alpha=0.25)
+
+    axes[0, 0].set_title(title)
+    axes[-1, 0].set_xlabel("day")
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def plot_series_with_regime_overlay(
+    data: pd.DataFrame,
+    regimes: pd.DataFrame,
+    output_path: Path,
+    title: str,
+    ylabel: str,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+    line_color: str = "black",
+    regime_colors: dict[str, str] | None = None,
+    regime_alpha: float = 0.16,
+) -> None:
+    """Plot each series with volatility-regime background shading."""
+    from matplotlib.patches import Patch
+
+    if regime_colors is None:
+        regime_colors = {
+            labels[0]: "#4C78A8",
+            labels[1]: "#BAB0AC",
+            labels[2]: "#E45756",
+        }
+
+    columns = [column for column in data.columns if column in regimes.columns]
+    if not columns:
+        raise ValueError("No data columns have matching regime labels.")
+
+    fig, axes = plt.subplots(
+        len(columns),
+        1,
+        figsize=(14, 2.1 * len(columns)),
+        sharex=True,
+        squeeze=False,
+    )
+
+    for row, column in enumerate(columns):
+        ax = axes[row, 0]
+        y = data[column]
+        ax.plot(y.index, y, color=line_color, linewidth=0.9, zorder=2)
+
+        aligned_regime = regimes[column].reindex(y.index)
+        for span in _regime_spans(aligned_regime):
+            label = str(span["label"])
+            if label not in regime_colors:
+                continue
+            start = aligned_regime.index[int(span["start_pos"])]
+            end = aligned_regime.index[int(span["end_pos"])]
+            ax.axvspan(
+                start,
+                end,
+                color=regime_colors[label],
+                alpha=regime_alpha,
+                linewidth=0,
+                zorder=0,
+            )
+
+        ax.set_ylabel(column)
+        ax.grid(True, alpha=0.2, zorder=1)
+
+    handles = [
+        Patch(facecolor=regime_colors[label], alpha=regime_alpha, label=f"{label} volatility")
+        for label in labels
+        if label in regime_colors
+    ]
+    axes[0, 0].legend(handles=handles, loc="upper left", ncol=len(handles))
+    axes[0, 0].set_title(title)
+    fig.supylabel(ylabel)
+    axes[-1, 0].set_xlabel("day")
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def plot_volatility_regime_shares(
+    regimes: pd.DataFrame,
+    output_path: Path,
+    title: str,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+) -> pd.DataFrame:
+    """Plot the cross-sectional share of assets in each volatility regime."""
+    shares = volatility_regime_shares(regimes, labels=labels)
+    colors = ["#4C78A8", "#BAB0AC", "#E45756"]
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.stackplot(shares.index, [shares[label] for label in labels], labels=labels, colors=colors, alpha=0.9)
+    ax.set_ylim(0, 1)
+    ax.set_title(title)
+    ax.set_xlabel("day")
+    ax.set_ylabel("share of classified assets")
+    ax.legend(loc="upper left", ncol=len(labels))
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.show()
+
+    return shares
+
+
+def system_volatility_regime(
+    regimes: pd.DataFrame,
+    lower_quantile: float = 1 / 3,
+    upper_quantile: float = 2 / 3,
+    labels: tuple[str, str, str] = VOLATILITY_REGIME_ORDER,
+    method: str = "gmm",
+    max_regimes: int = 3,
+    min_regime_share: float = 0.03,
+    min_spell_length: int = 1,
+    random_state: int = 42,
+) -> dict[str, pd.Series | pd.DataFrame]:
+    """Classify each day by the cross-sectional volatility regime score."""
+    if not 0 < lower_quantile < upper_quantile < 1:
+        raise ValueError("Expected 0 < lower_quantile < upper_quantile < 1.")
+    if method not in {"gmm", "quantile"}:
+        raise ValueError("method must be either 'gmm' or 'quantile'.")
+    if not 1 <= max_regimes <= len(labels):
+        raise ValueError("max_regimes must be between 1 and the number of labels.")
+
+    numeric = _regime_numeric_frame(regimes, labels=labels)
+    score = numeric.mean(axis=1)
+    valid_score = score.dropna()
+    state = pd.Series(index=score.index, dtype="object", name="system_volatility_regime")
+
+    if valid_score.empty:
+        thresholds = pd.Series(
+            {"low_medium_threshold": np.nan, "medium_high_threshold": np.nan},
+            name="system_regime_thresholds",
+        )
+        return {"score": score.rename("system_volatility_score"), "regime": state, "thresholds": thresholds}
+
+    if method == "quantile":
+        low_threshold = valid_score.quantile(lower_quantile)
+        high_threshold = valid_score.quantile(upper_quantile)
+        state.loc[score <= low_threshold] = labels[0]
+        state.loc[(score > low_threshold) & (score <= high_threshold)] = labels[1]
+        state.loc[score > high_threshold] = labels[2]
+        centers = {
+            labels[0]: valid_score[valid_score <= low_threshold].median(),
+            labels[1]: valid_score[(valid_score > low_threshold) & (valid_score <= high_threshold)].median(),
+            labels[2]: valid_score[valid_score > high_threshold].median(),
+        }
+        n_fitted_regimes = 3
+    else:
+        values = valid_score.to_numpy().reshape(-1, 1)
+        max_valid_regimes = min(max_regimes, len(np.unique(values)), len(values))
+        candidates = []
+        for n_components in range(1, max_valid_regimes + 1):
+            model = GaussianMixture(
+                n_components=n_components,
+                covariance_type="full",
+                n_init=10,
+                random_state=random_state,
+            ).fit(values)
+            component = model.predict(values)
+            component_shares = np.bincount(component, minlength=n_components) / len(component)
+            candidates.append(
+                {
+                    "model": model,
+                    "component": component,
+                    "bic": model.bic(values),
+                    "min_share": component_shares.min(),
+                }
+            )
+
+        valid_candidates = [candidate for candidate in candidates if candidate["min_share"] >= min_regime_share]
+        best = min(valid_candidates or candidates, key=lambda candidate: candidate["bic"])
+        model = best["model"]
+        component = best["component"]
+        ordered_components = np.argsort(model.means_.ravel())
+        n_fitted_regimes = len(ordered_components)
+
+        if n_fitted_regimes == 1:
+            ordered_labels = [labels[1]]
+        elif n_fitted_regimes == 2:
+            ordered_labels = [labels[0], labels[2]]
+        else:
+            ordered_labels = list(labels)
+
+        component_to_label = {
+            component_id: ordered_labels[rank]
+            for rank, component_id in enumerate(ordered_components)
+        }
+        state.loc[valid_score.index] = [component_to_label[component_id] for component_id in component]
+
+        center_by_label = {
+            component_to_label[component_id]: model.means_.ravel()[component_id]
+            for component_id in ordered_components
+        }
+        centers = {label: center_by_label.get(label, np.nan) for label in labels}
+
+        ordered_centers = np.sort(model.means_.ravel())
+        if n_fitted_regimes == 1:
+            low_threshold = np.nan
+            high_threshold = np.nan
+        elif n_fitted_regimes == 2:
+            low_threshold = ordered_centers[:2].mean()
+            high_threshold = np.nan
+        else:
+            low_threshold = ordered_centers[:2].mean()
+            high_threshold = ordered_centers[1:3].mean()
+
+    state, n_short_spells_merged = enforce_minimum_regime_spell_length(
+        state,
+        min_spell_length=min_spell_length,
+        values=score,
+        centers=centers,
+    )
+    n_regimes = state.dropna().nunique()
+
+    thresholds = pd.Series(
+        {
+            "low_medium_threshold": low_threshold,
+            "medium_high_threshold": high_threshold,
+            "low_center": centers[labels[0]],
+            "medium_center": centers[labels[1]],
+            "high_center": centers[labels[2]],
+            "n_regimes": n_regimes,
+            "n_fitted_regimes": n_fitted_regimes,
+            "regime_method": method,
+            "min_spell_length": min_spell_length,
+            "n_short_spells_merged": n_short_spells_merged,
+        },
+        name="system_regime_thresholds",
+    )
+    return {"score": score.rename("system_volatility_score"), "regime": state, "thresholds": thresholds}
+
+
+def regime_conditional_correlation_matrices(
+    returns: pd.DataFrame,
+    regime_state: pd.Series,
+    labels: tuple[str, ...] = VOLATILITY_REGIME_ORDER,
+    min_observations: int = 50,
+) -> dict[str, pd.DataFrame]:
+    """Estimate return-correlation matrices conditional on one regime state per day."""
+    aligned_state = regime_state.reindex(returns.index)
+    return {
+        label: returns.loc[aligned_state == label].corr(min_periods=min_observations)
+        for label in labels
+    }
+
+
+def regime_conditional_correlation_summary(
+    returns: pd.DataFrame,
+    regime_state: pd.Series,
+    labels: tuple[str, ...] = VOLATILITY_REGIME_ORDER,
+    min_observations: int = 50,
+) -> pd.DataFrame:
+    """Pairwise correlations conditional on one regime state per day."""
+    aligned_state = regime_state.reindex(returns.index)
+    full_correlation = returns.corr()
+    rows = []
+
+    for asset_1, asset_2 in itertools.combinations(returns.columns, 2):
+        pair_returns = returns[[asset_1, asset_2]]
+        observed_pair = pair_returns.notna().all(axis=1)
+        full_pair_corr = full_correlation.loc[asset_1, asset_2]
+
+        for label in labels:
+            mask = observed_pair & (aligned_state == label)
+            n_observations = int(mask.sum())
+            correlation = (
+                pair_returns.loc[mask, asset_1].corr(pair_returns.loc[mask, asset_2])
+                if n_observations >= min_observations
+                else np.nan
+            )
+            rows.append(
+                {
+                    "pair": f"{asset_1} vs {asset_2}",
+                    "asset_1": asset_1,
+                    "asset_2": asset_2,
+                    "regime": label,
+                    "n_observations": n_observations,
+                    "correlation": correlation,
+                    "full_sample_correlation": full_pair_corr,
+                    "delta_from_full_sample": correlation - full_pair_corr if pd.notna(correlation) else np.nan,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def pair_same_regime_correlation_summary(
+    returns: pd.DataFrame,
+    regimes: pd.DataFrame,
+    labels: tuple[str, ...] = VOLATILITY_REGIME_ORDER,
+    min_observations: int = 50,
+) -> pd.DataFrame:
+    """Pairwise correlations when both assets are in the same volatility regime."""
+    available_assets = [asset for asset in returns.columns if asset in regimes.columns]
+    full_correlation = returns.corr()
+    rows = []
+
+    for asset_1, asset_2 in itertools.combinations(available_assets, 2):
+        pair_returns = returns[[asset_1, asset_2]]
+        observed_pair = pair_returns.notna().all(axis=1)
+        full_pair_corr = full_correlation.loc[asset_1, asset_2]
+
+        for label in labels:
+            mask = observed_pair & (regimes[asset_1] == label) & (regimes[asset_2] == label)
+            n_observations = int(mask.sum())
+            correlation = (
+                pair_returns.loc[mask, asset_1].corr(pair_returns.loc[mask, asset_2])
+                if n_observations >= min_observations
+                else np.nan
+            )
+            rows.append(
+                {
+                    "pair": f"{asset_1} vs {asset_2}",
+                    "asset_1": asset_1,
+                    "asset_2": asset_2,
+                    "regime": label,
+                    "n_observations": n_observations,
+                    "correlation": correlation,
+                    "full_sample_correlation": full_pair_corr,
+                    "delta_from_full_sample": correlation - full_pair_corr if pd.notna(correlation) else np.nan,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def wide_regime_correlation_summary(
+    summary: pd.DataFrame,
+    labels: tuple[str, ...] = VOLATILITY_REGIME_ORDER,
+) -> pd.DataFrame:
+    """Convert a long regime-correlation table into one row per asset pair."""
+    index_columns = ["pair", "asset_1", "asset_2"]
+    correlation_wide = (
+        summary.pivot(index=index_columns, columns="regime", values="correlation")
+        .reindex(columns=labels)
+        .reset_index()
+    )
+    observation_wide = (
+        summary.pivot(index=index_columns, columns="regime", values="n_observations")
+        .reindex(columns=labels)
+        .add_prefix("n_")
+        .reset_index()
+    )
+    full_sample = summary[index_columns + ["full_sample_correlation"]].drop_duplicates(index_columns)
+
+    output = correlation_wide.merge(full_sample, on=index_columns).merge(observation_wide, on=index_columns)
+    if labels[0] in output.columns and labels[-1] in output.columns:
+        output[f"{labels[-1]}_minus_{labels[0]}"] = output[labels[-1]] - output[labels[0]]
+    return output
+
+
+def plot_regime_conditional_correlation_matrices(
+    matrices: dict[str, pd.DataFrame],
+    output_path: Path,
+    title: str,
+    labels: tuple[str, ...] = VOLATILITY_REGIME_ORDER,
+    cmap: str = "coolwarm",
+) -> None:
+    """Plot one correlation heatmap for each volatility regime."""
+    fig, axes = plt.subplots(1, len(labels), figsize=(5.2 * len(labels), 4.8), squeeze=False)
+
+    for col, label in enumerate(labels):
+        ax = axes[0, col]
+        matrix = matrices[label]
+        mask = np.triu(np.ones_like(matrix, dtype=bool), k=0)
+        sns.heatmap(
+            matrix,
+            annot=True,
+            fmt=".2f",
+            cmap=cmap,
+            center=0,
+            vmin=-1,
+            vmax=1,
+            mask=mask,
+            cbar=col == len(labels) - 1,
+            ax=ax,
+        )
+        ax.set_title(f"{label} volatility")
+
+    fig.suptitle(title, y=1.03)
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.show()
+
+
+def plot_regime_correlation_differences(
+    wide_summary: pd.DataFrame,
+    output_path: Path,
+    title: str,
+    low_regime: str = "low",
+    high_regime: str = "high",
+    top_n: int | None = None,
+) -> None:
+    """Plot high-minus-low conditional correlation differences by pair."""
+    diff_col = f"{high_regime}_minus_{low_regime}"
+    if diff_col not in wide_summary.columns:
+        raise ValueError(f"Expected a '{diff_col}' column in wide_summary.")
+
+    data = wide_summary.dropna(subset=[diff_col]).sort_values(diff_col)
+    if top_n is not None and len(data) > top_n:
+        half = max(1, top_n // 2)
+        data = pd.concat([data.head(half), data.tail(top_n - half)]).sort_values(diff_col)
+
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.35 * len(data))))
+    colors = np.where(data[diff_col] >= 0, "tab:red", "tab:blue")
+    ax.barh(data["pair"], data[diff_col], color=colors, alpha=0.8)
+    ax.axvline(0, color="black", linewidth=1)
+    ax.set_xlabel(f"{high_regime} correlation minus {low_regime} correlation")
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.show()
 
 
 def _threshold_label(threshold: float) -> str:
