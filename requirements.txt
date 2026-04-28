@@ -7,3 +7,5 @@ seaborn
 scipy
 statsmodels
 arch
+scikit-learn
+ipykernel
